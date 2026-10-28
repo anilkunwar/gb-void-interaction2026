@@ -1,13 +1,46 @@
 """
 UO2 Intergranular Void – Grain Boundary Interaction Phase-Field FFT Simulator
 =========================================================================
-Physics: MPF (multi-phase-field) + Cahn-Hilliard (c_v, c_i) + Allen-Cahn (η, φ_i)
-         + Anisotropic mobility (bulk + surface + GB tensors)
+Physics: MPF (multi-phase-field) + Cahn-Hilliard (c_v, c_i) + Allen-Cahn
+         (eta, phi_i) + Anisotropic mobility (bulk + surface + GB tensors)
          + Cascade irradiation source terms + recombination + GB sinks
          + Spectral elastoplasticity (plane-strain, isotropic UO2)
          + J2 plasticity flow rule (overstress power law, Hall-Petch yield)
-         + Larché-Cahn stress coupling into c_v / c_i chemical potentials.
+         + Larche-Cahn stress coupling into c_v / c_i chemical potentials.
 
+This is a conversion of an Au-assisted Cu-Cu diffusion bonding MPF simulator
+(rectangular MPF edition) into a UO2 void-GB irradiation model. The
+conversion:
+  * Removes the upper poly-Cu substrate and the Au nanofilm layer.
+  * Replaces the nc-Cu substrate with polycrystalline UO2.
+  * Replaces the Au concentration field `c` with two conserved concentration
+    fields `c_v` (vacancy) and `c_i` (interstitial), governed by modified
+    Cahn-Hilliard equations with cascade source terms, recombination, and
+    GB sinks.
+  * Adds the void order parameter eta (Allen-Cahn).
+  * Replaces the per-grain eta_i list with grain-orientation order parameters
+    phi_i (Allen-Cahn) plus an optional artificial driving force f_d for the
+    flat-GB scenarios.
+  * Implements the anisotropic mobility tensor decomposition with bulk,
+    surface, and GB contributions.
+  * Retains the spectral elastoplasticity solver (plane-strain) and the
+    J2 plasticity flow rule from the original code, re-parameterised with
+    UO2 elastoplastic constants (E=220 GPa, nu=0.31, sigma_y0=150 MPa,
+    H=5 GPa) and feeds the hydrostatic stress back into the vacancy /
+    interstitial chemical potentials via the Larche-Cahn coupling
+    (Omega_v * sigma_h on c_v, Omega_i * sigma_h on c_i).
+  * Supports three simulation scenarios:
+      (1) Multiple voids + flat GB
+      (2) GB migration under irradiation
+      (3) Polycrystalline UO2 grain growth + void formation
+
+Outputs (saved to /home/z/my-project/download/):
+  * PNG field snapshots (multi-field grid: c_v, c_i, eta, grain map,
+    sigma_eq, ...)
+  * CSV time-series (porosity, mean c_v, GB area, max sigma_eq, plastic
+    work, ...)
+  * Pickled / npz-saved full frame history for later reload
+  * MP4 / GIF animation of the eta (void) field
 """
 
 import numpy as np
@@ -369,7 +402,7 @@ def apply_matplotlib_theme(theme_name: str, cfg: dict):
 # ============================================================================
 # Fields tracked by the UO2 phase-field solver and made available to the
 # visualizer. Note that 'grain_map' is derived as argmax(φ_i) and 'phi_gb'
-# is the GB indicator 1 - Σφ_i² .
+# is the GB indicator 1 - Σφ_i² (Φ = 1 inside grain, < 1 at GBs).
 FIELD_DEFAULT_CMAPS = {
     'c_v':         'cv_conc',
     'c_i':         'ci_conc',
@@ -435,7 +468,7 @@ TIME_UNITS = {
     'μs': {'label': 'μs', 'long': 'microseconds'},
     'ms': {'label': 'ms', 'long': 'milliseconds'},
     's':  {'label': 's',  'long': 'seconds'},
-    'τ (reduced)': {'label': 'τ',  'long': 'reduced units '},
+    'τ (reduced)': {'label': 'τ',  'long': 'reduced units (t* = 0.01 s)'},
 }
 
 DEFAULT_TIME_UNIT = 'τ (reduced)'
@@ -1285,17 +1318,14 @@ def render_live_colormap_picker(viz_cfg, *, key_prefix='cmap',
 # ============================================================================
 # UO2 MATERIAL PROPERTIES
 # ============================================================================
-# Elastoplasticity with Ronchi-Fittelmann (1979)
-# elastoplastic constants for UO2 at 1273 K.
-#
-# Non-dimensionalisation: l* = 1 nm, t* = 0.01 s.
-# All diffusivities are stored as the scalar D_v (or D_i) coefficient that
-# multiplies the (D_b + D_s + D_GB) tensor sum per Eqs. (13)-(14).
+# UO2 properties at 1273 K. Non-dimensionalisation: l* = 1 nm, t* = 0.01 s.
+# All diffusivities are stored as the scalar D_v / D_i coefficient that
+# multiplies the (D_b + D_s + D_GB) tensor sum.
 class UO2Properties:
     @staticmethod
     def get_uo2_properties():
         """Returns a dict of UO2 properties in reduced units (l*=1 nm, t*=0.01 s)."""
-        # ---- Lattice / thermodynamics  ----
+        # ---- Lattice / thermodynamics ----
         a_lattice = 0.547           # nm
         T = 1273.0                  # K
         k_B = 1.381e-23             # J/K
@@ -1307,13 +1337,13 @@ class UO2Properties:
         E_surf = 0.6                # void free-surface energy (eV)
         E_gb   = 0.3                # GB energy (eV)
 
-        # ---- Diffusivities  ----
-        # Physical: D_v = 3.346e-17 m²/s, D_i = 1.623e-9 m²/s (Kinoshita 1997)
+        # ---- Diffusivities (scalar coefficient) ----
+        # Physical: D_v = 3.346e-17 m²/s, D_i = 1.623e-9 m²/s
         # Reduced: D_phys × t* / l*² = D_phys × 0.01 / 1e-18
         D_v = 3.346e-17 * 0.01 / 1e-18   # = 0.3346 (dimensionless)
         D_i = 1.623e-9  * 0.01 / 1e-18   # = 1.623e7 (dimensionless)
 
-        # Mobility weights ( w_b=w_s=1e-4, w_GB=0.1)
+        # Mobility weights (w_b = w_s = 1e-4, w_GB = 0.1)
         w_b  = 1e-4
         w_s  = 1e-4
         w_GB = 0.1
@@ -1322,7 +1352,7 @@ class UO2Properties:
         # Physical: 3.38e-8 J/m. Reduced: κ × t* / (N × kBT × l*²)
         # N = 1/a³ ≈ 6.13 nm⁻³ = 6.13e27 m⁻³. N×kBT ≈ 1.08e8 J/m³.
         # κ_reduced = 3.38e-8 × 0.01 / (1.08e8 × 1e-18) ≈ 3.13
-        kappa = 3.13                  # reduced units ( physical 3.38e-8 J/m)
+        kappa = 3.13                  # reduced units (physical: 3.38e-8 J/m)
 
         # ---- Allen-Cahn mobility ----
         # Physical: L = 1.56e-11 m³/(J·s). Reduced: L × t* × N × kBT / l*²
@@ -1330,7 +1360,7 @@ class UO2Properties:
         # Use a slightly larger default for visible evolution on a 256² grid.
         L_ac = 1.0                    # Allen-Cahn mobility (reduced)
 
-        # ---- Elastoplastic (Ronchi & Fitelmann 1979, 1273 K UO2) ----
+        # ---- Elastoplastic (1273 K UO2) ----
         E_young = 220.0e9             # Pa
         nu_poisson = 0.31
         sigma_y0 = 150.0e6            # Pa, initial yield stress
@@ -1465,12 +1495,12 @@ def make_warp_field(Nx, Ny, extent, amplitude, wavelength_nm, seed=0):
 # UO2 GEOMETRY — 3 SCENARIOS
 # ============================================================================
 class UO2Geometry:
-    """Builds initial c_v, c_i, η, φ_i fields for three scenarios:
-      (1) 'multi_void_gb'  — Sec. 3.1.2, Fig. 5: 3 voids of different radii
-                              in front of a flat GB, no irradiation.
-      (2) 'gb_irradiation' — Sec. 3.1.3, Fig. 6: flat GB + irradiation source.
-      (3) 'polycrystal'    — Sec. 3.2,    Fig. 7: 64-grain periodic polycrystal
-                              with irradiation-driven void formation.
+    """Builds initial c_v, c_i, eta, phi_i fields for three scenarios:
+      (1) 'multi_void_gb'  — 3 voids of different radii in front of a
+                              flat GB, no irradiation.
+      (2) 'gb_irradiation' — flat GB + irradiation source.
+      (3) 'polycrystal'    — 64-grain periodic polycrystal with
+                              irradiation-driven void formation.
 
     Returns
     -------
@@ -1702,7 +1732,7 @@ class SpectralElasticSolver:
     """Spectral elasticity solver for plane-strain isotropic UO2.
 
     Takes (lam, mu) Lame parameters (derived from E=220 GPa, ν=0.31 for the
-    Ronchi-Fittelmann UO2 defaults). The solver builds the periodic Green's
+    UO2 defaults). The solver builds the periodic Green's
     function for plane-strain elasticity and returns stress + strain from
     a given eigenstrain + applied stress.
     """
@@ -1778,11 +1808,11 @@ class SpectralElasticSolver:
 # ============================================================================
 # Implements the modified Cahn-Hilliard + Allen-Cahn + J2 elastoplasticity
 # model, with the following extensions:
-#   * Spectral semi-implicit time stepping 
-#     for improved stability at larger dt.
-#   * Full J2 plasticity flow rule (overstress power law, Hall-Petch yield)
-#     retained from the original Cu/Au/Cu code, re-parameterised for UO2
-#     with Ronchi-Fittelmann elastoplastic constants.
+#   * Spectral semi-implicit time stepping for improved stability at
+#     larger dt.
+#   * Full J2 plasticity flow rule (overstress power law, Hall-Petch
+#     yield) retained from the original Cu/Au/Cu code, re-parameterised
+#     for UO2 with UO2 elastoplastic constants.
 #   * Larché-Cahn stress coupling: hydrostatic stress σ_h enters the
 #     vacancy/interstitial chemical potentials via Ω_v·σ_h / Ω_i·σ_h.
 class UO2VoidGBSolver:
@@ -1804,9 +1834,8 @@ class UO2VoidGBSolver:
       5. Compute chemical potentials μ_v, μ_i (with Larché-Cahn σ_h coupling).
       6. Cahn-Hilliard step for c_v, c_i (semi-implicit spectral + explicit
          cascade source P_v/P_i, recombination A_iv, GB sinks S_v^GB/S_i^GB).
-      7. Allen-Cahn step for η (with stochastic + P_v source per Eq. 22).
-      8. Allen-Cahn step for φ_i (with optional artificial driving force
-         f_d per Eq. 28).
+      7. Allen-Cahn step for eta (with stochastic + P_v source).
+      8. Allen-Cahn step for phi_i (with optional artificial driving force).
       9. Update history (porosity, mean c_v, GB area, max σ_eq, plastic work).
     """
 
@@ -1866,7 +1895,7 @@ class UO2VoidGBSolver:
         self.w_s = diff['w_s']
         self.w_GB = diff['w_GB']
         self.kappa = grad['kappa']
-        # Per-field gradient coefficients ( same κ for all)
+        # Per-field gradient coefficients (uses same kappa for all fields)
         self.kappa_cv = self.kappa
         self.kappa_ci = self.kappa
         self.kappa_phi = self.kappa
@@ -1875,7 +1904,7 @@ class UO2VoidGBSolver:
         # Polycrystal energy parameters
         self.a_GB = 1.0           # diffuse GB interface parameter
         self.a_s = self.a_GB * self.E_surf / max(self.E_gb, 1e-9)
-        self.mu_poly = 1.0        # polycrystal energy coefficient ( μ)
+        self.mu_poly = 1.0        # polycrystal energy coefficient
 
         # kBT in eV (used for entropy term in f_s)
         self.kBT = self.mat['lattice']['kBT_eV']
@@ -1907,14 +1936,14 @@ class UO2VoidGBSolver:
         # V_G = K_dot / P_casc (max concentration increment per cascade)
         self.V_G = self.K_dot / max(self.P_casc, 1e-9)
         self.production_bias = float(params.get('production_bias', 2.0 / 3.0))
-        # Recombination rates 
+        # Recombination rates
         self.A_bulk = float(params.get('A_bulk', 1.0))
         self.A_surf = float(params.get('A_surf', 5.0))
-        # GB sink strengths 
+        # GB sink strengths
         self.S_v_r = float(params.get('S_v_r', 1.0))
         self.S_i_r = float(params.get('S_i_r', 1.0))
 
-        # Artificial driving force  — only used in flat-GB scenarios
+        # Artificial driving force — only used in flat-GB scenarios
         f_d = params.get('f_d', self.geom_meta.get('f_d_default', (0.0, 0.0)))
         self.f_d_x = float(f_d[0])
         self.f_d_y = float(f_d[1])
@@ -1943,8 +1972,8 @@ class UO2VoidGBSolver:
     # FIELD DIAGNOSTICS
     # ==================================================================
     def compute_gb_indicator(self):
-        """Φ = Σφ_i² — equal to 1 inside a grain, < 1 at GBs and triple junctions
-        ."""
+        """Phi = Sum phi_i^2 -- equal to 1 inside a grain, < 1 at GBs and triple
+        junctions."""
         s = np.zeros((self.Ny, self.Nx))
         for phi in self.phi_list:
             s += phi ** 2
@@ -1980,12 +2009,12 @@ class UO2VoidGBSolver:
         return int(n), total_vol
 
     # ==================================================================
-    # ANISOTROPIC MOBILITY 
+    # ANISOTROPIC MOBILITY (bulk + surface + GB tensor contributions)
     # ==================================================================
     def compute_mobility_field_v(self):
         """Effective scalar mobility field for vacancies.
 
-        Combines bulk, surface, and GB contributions .
+        Combines bulk, surface, and GB contributions.
         We collapse the tensorial form into an effective scalar mobility
         M_v(r) = D_v · (w_b + w_s · c_v²·(1-c_v²) + w_GB · (1-Φ)),
         which captures the magnitude of the surface/GB enhancement while
@@ -2014,10 +2043,10 @@ class UO2VoidGBSolver:
         return np.maximum(M_i, 1e-12)
 
     # ==================================================================
-    # FREE ENERGY DERIVATIVES 
+    # FREE ENERGY DERIVATIVES
     # ==================================================================
     def compute_chemical_potential_v(self, sigma_h_Pa):
-        """μ_v = δF/δc_v  ( includes Larché-Cahn coupling).
+        """mu_v = dF/dc_v  (bulk free energy derivative + Larche-Cahn coupling).
 
         μ_v = N · [ h(η)·(Ef_v + kBT·ln(c_v/(1-c_v-c_i)))
                    + j(η)·2·(c_v - 1) ]
@@ -2065,7 +2094,7 @@ class UO2VoidGBSolver:
         return mu_i
 
     def compute_dF_deta(self):
-        """δF/δη .
+        """dF/deta  (free energy derivative with respect to void OP).
 
         δF/δη = N · [ 2(η-1)·f_s + 2η·f_v
                      + μ_poly·(η³ - η + 2·a_s·η·Σφ_i²) ]
@@ -2092,7 +2121,7 @@ class UO2VoidGBSolver:
         return dF_deta
 
     def compute_dF_dphi(self, i):
-        """δF/δφ_i  .
+        """dF/dphi_i  (free energy derivative with respect to grain OP).
 
         δF/δφ_i = N · μ_poly · [ φ_i³ - φ_i + 2·a_GB·φ_i·Σ_{j≠i}φ_j²
                                   + 2·a_s·η²·φ_i ]
@@ -2114,7 +2143,7 @@ class UO2VoidGBSolver:
         return dF_dphi
 
     # ==================================================================
-    # CASCADE SOURCE TERMS 
+    # CASCADE SOURCE TERMS (stochastic vacancy/interstitial pair production)
     # ==================================================================
     def compute_cascade_source(self):
         """Stochastic cascade production of vacancy/interstitial pairs.
@@ -2134,7 +2163,7 @@ class UO2VoidGBSolver:
         return P_v, P_i
 
     # ==================================================================
-    # RECOMBINATION + GB SINKS 
+    # RECOMBINATION + GB SINKS
     # ==================================================================
     def compute_recombination(self):
         """A_iv = (A_bulk + η²·A_surf) · c_v · c_i."""
@@ -2278,7 +2307,7 @@ class UO2VoidGBSolver:
     # TIME STEPPING — ALLEN-CAHN (η, φ_i)
     # ==================================================================
     def evolve_eta(self, P_v):
-        """Allen-Cahn step for void order parameter η .
+        """Allen-Cahn step for void order parameter eta.
 
         ∂η/∂t = -L·(δF/δη) + σ_stochastic + P_v
         """
@@ -2295,16 +2324,16 @@ class UO2VoidGBSolver:
         return np.clip(eta_new, 0.0, 1.0)
 
     def evolve_phi_list(self):
-        """Allen-Cahn step for all grain-orientation order parameters φ_i
-        ( with optional artificial driving force ).
+        """Allen-Cahn step for all grain-orientation order parameters phi_i
+        (with optional artificial driving force f_d).
 
-        ∂φ_i/∂t = -L·(δF/δφ_i + f_d · ∇φ_i)   [Eq. 28]
+        dphi_i/dt = -L * (dF/dphi_i + f_d * grad phi_i)
         """
         new_phi_list = []
         for i in range(self.n_grains):
             dF_dphi = self.compute_dF_dphi(i)
             # Artificial driving force (only on the first grain in flat-GB
-            # scenarios, mimicking f_d pushing the GB)
+            # scenarios, f_d pushes the GB)
             if self.geom_meta['has_driving_force'] and i == 0:
                 phi_gx, phi_gy = spectral_gradients(self.phi_list[i],
                                                      self.kx, self.ky)
@@ -3601,7 +3630,7 @@ def main():
     + Anisotropic mobility (bulk + surface + GB) + Cascade irradiation sources
     + Recombination + GB sinks + Spectral elastoplasticity (J2 flow rule,
     Hall-Petch yield) + Larché-Cahn σ_h coupling.<br>
-    <b>Material:</b> UO2 at 1273 K (Ronchi-Fittelmann elastoplastic constants).<br>
+        <b>Material:</b> UO2 at 1273 K (E=220 GPa, nu=0.31, sigma_y0=150 MPa).<br>
     <span class="viz-badge">3 scenarios: multi-void+GB · GB migration under irradiation · polycrystal</span>
     </div>
     """, unsafe_allow_html=True)
@@ -3621,9 +3650,9 @@ def main():
                 ['multi_void_gb', 'gb_irradiation', 'polycrystal'],
                 index=0,
                 format_func=lambda x: {
-                    'multi_void_gb':  'Multi-void + flat GB ',
-                    'gb_irradiation': 'GB migration under irradiation (Sec 3.1.3)',
-                    'polycrystal':    'Polycrystalline UO2 (Sec 3.2, Fig 7)',
+                    'multi_void_gb':  'Multi-void + flat GB',
+                    'gb_irradiation': 'GB migration under irradiation',
+                    'polycrystal':    'Polycrystalline UO2',
                 }[x],
                 help="Selects the initial geometry and which physics modules "
                      "are active (irradiation source terms, artificial GB "
@@ -3663,9 +3692,9 @@ def main():
                 n_grains_flat = 2
                 gb_width_nm = 2.5
                 n_poly_grains = st.slider(
-                    "Number of grains", 4, 128, 32, 4,
-                    help="Number of Max Grains, Higher = more memory "
-                         "(~0.5 MB per grain at 128×128).")
+                    "Number of grains", 4, 64, 32, 4,
+                    help="Default 64. Higher = more memory "
+                         "(~0.5 MB per grain at 128x128).")
                 poly_grain_size_nm = st.slider(
                     "Target grain size (nm)", 10.0, 80.0, 30.0, 5.0)
                 use_warp = st.checkbox(
@@ -3713,8 +3742,8 @@ def main():
                 index=time_unit_keys.index(
                     st.session_state.get('time_unit_sel', DEFAULT_TIME_UNIT)),
                 key="time_unit_sel",
-                help="Pick the physical time unit for display. 'τ' is the "
-                     "reduced unit (t* = 0.01 s).")
+                help="Pick the physical time unit for display. 'τ' is the reduced "
+                     "unit (t* = 0.01 s).")
             dt = st.slider(f"dt ({time_unit})", 1e-4, 5e-2, 1e-2, 1e-4,
                             format="%.5f")
             n_steps = st.slider("Steps", 20, 2000, 200, 20)
@@ -3743,7 +3772,7 @@ def main():
                 K_dot = st.slider(
                     "K_dot (dpa per τ)", 1e-4, 5e-2, K_dot_default, 1e-4,
                     format="%.4f",
-                    help="Displacement rate (5e-3 dpa/τ).")
+                    help="Displacement rate (default 5e-3 dpa/τ).")
                 P_casc = st.slider(
                     "P_casc (cascade probability)", 1e-3, 0.2, 0.05, 1e-3,
                     format="%.3f",
@@ -3786,7 +3815,7 @@ def main():
                 f_d_x = st.slider(
                     "f_d_x (artificial GB driving force)", 0.0, 1.0,
                     f_d_default, 0.05,
-                    help="f_d pushes the GB in the +x direction. "
+                    help="Artificial driving force — pushes the GB in the +x direction. "
                          "0.2 for multi-void, 0.4 for irradiation scenario.")
                 f_d_y = 0.0
             else:
@@ -5067,7 +5096,6 @@ def _render_compare_view(ids, viz_cfg):
 # ============================================================================
 if __name__ == "__main__":
     main()
-
 
 
 
