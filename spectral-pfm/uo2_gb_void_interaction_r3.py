@@ -1688,8 +1688,10 @@ class UO2Geometry:
                                     mask=None, warp=warp)
 
         # Build phi_i fields (one per grain)
-        # diffuse GB width in pixels
-        sigma_gb = max(1.5, 0.5 * 2.5 / self.dx)  # ~2.5 nm GB
+        # Diffuse GB width in pixels. Use a NARROW Gaussian (sigma ~ 1 px)
+        # so grain interiors have phi_i ≈ 1 (Sum phi^2 ≈ 1) and only the
+        # GB region (~2 nm wide) has reduced Sum phi^2.
+        sigma_gb = max(1.0, 1.0 / self.dx)  # ~1 nm GB half-width
         phi_list = []
         for g in range(max_grains):
             m = (grain_map == g).astype(float)
@@ -1898,7 +1900,14 @@ class UO2VoidGBSolver:
         # Per-field gradient coefficients (uses same kappa for all fields)
         self.kappa_cv = self.kappa
         self.kappa_ci = self.kappa
-        self.kappa_phi = self.kappa
+        # Grain OP gradient coefficient: use a MUCH SMALLER value than kappa
+        # to prevent over-rapid diffusion of phi_i fields (which would
+        # dissolve the grain structure). The MPF normalization Sum(phi_i)=1
+        # plus the a_GB interaction term maintain sharp GBs; kappa_phi only
+        # controls the GB diffuse width. The concentration/void fields use
+        # the full kappa (3.13) for their gradient energy, but the grain OPs
+        # need a much smaller value (~0.3) to preserve grain structure.
+        self.kappa_phi = float(params.get('kappa_phi', 0.1 * self.kappa))
         self.kappa_eta = self.kappa
         self.L_ac = float(params.get('L_ac', mob['L_ac']))
         # Polycrystal energy parameters
@@ -2160,14 +2169,21 @@ class UO2VoidGBSolver:
     def compute_dF_dphi(self, i):
         """dF/dphi_i  (free energy derivative with respect to grain OP).
 
-        Double-well potential: W(phi) = phi^2 * (1-phi)^2
-        Derivative:            dW/dphi = 2*phi*(1-phi)*(1-2*phi)
-        Minima at phi=0 and phi=1 (both stable). The old form (phi^3 - phi)
-        had an unstable maximum at phi=0 and pushed all phi_i -> 1.
+        Multi-phase-field formulation: potential V(phi) = phi^4/4 - phi^2/2
+        has a MINIMUM at phi = 1 (and at phi = -1, but phi is clipped to
+        [0, 1]). The normalization Sum(phi_i) = 1 (enforced in
+        evolve_phi_list) prevents all grain OPs from going to 1 at once,
+        which is what creates stable grain boundaries.
 
-        dF/dphi_i = mu_poly * [ 2*phi_i*(1-phi_i)*(1-2*phi_i)   [double-well]
-                                + 2*a_GB*phi_i*Sum_{j!=i}(phi_j^2)  [grain interaction]
-                                + 2*a_s*eta^2*phi_i ]               [void coupling]
+        DO NOT use the 0/1 double-well (2*phi*(1-phi)*(1-2*phi)) here --
+        that would give minima at phi=0 and phi=1, but in a multi-phase-
+        field model phi=0 is the "not this grain" state and phi=1 is the
+        "this grain" state. The normalization, not a double-well, is what
+        keeps the grain structure intact.
+
+        dF/dphi_i = mu_poly * [ phi_i^3 - phi_i                        [MPF double-well, min at 1]
+                                + 2*a_GB*phi_i*Sum_{j!=i}(phi_j^2)     [grain-grain interaction]
+                                + 2*a_s*eta^2*phi_i ]                  [void coupling]
                     - kappa_phi * laplacian(phi_i)
         """
         phi_i = self.phi_list[i]
@@ -2175,11 +2191,11 @@ class UO2VoidGBSolver:
         # Sum_{j!=i} phi_j^2 = (Sum phi_j^2) - phi_i^2
         sum_phi_sq_all = self.compute_gb_indicator()
         sum_others_sq = sum_phi_sq_all - phi_i ** 2
-        # Double-well (minima at 0,1) + grain interaction + void coupling
+        # MPF double-well (minimum at phi=1) + grain interaction + void coupling
         dF_dphi = self.mu_poly * (
-            2.0 * phi_i * (1.0 - phi_i) * (1.0 - 2.0 * phi_i)   # dW/dphi, minima at 0,1
-            + 2.0 * self.a_GB * phi_i * sum_others_sq            # grain-grain interaction
-            + 2.0 * self.a_s * (eta ** 2) * phi_i                # void coupling
+            phi_i ** 3 - phi_i                                   # MPF well, min at phi=1
+            + 2.0 * self.a_GB * phi_i * sum_others_sq             # grain-grain interaction
+            + 2.0 * self.a_s * (eta ** 2) * phi_i                 # void coupling
         )
         # Gradient term
         dF_dphi -= self.kappa_phi * spectral_laplacian(phi_i, self.k2)
