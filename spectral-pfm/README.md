@@ -1,4 +1,4 @@
- # Phase Field FFT Solver (Allen-Cahn  and ElastoPlasticity Mechanics) in UO2 Nuclear Fuel Material
+ # Phase Field FFT Solver (Allen-Cahn  and ElastoPlasticity Mechanics) for Simulation of Voids in UO2 Nuclear Fuel Material
 
  ## r1-r2: Flexible domain size, t in s  ( Elastoplasticity : J2 Flow Rule)
 
